@@ -1,0 +1,1924 @@
+diff --git a/creativegan.py b/creativegan.py
+index bf684f8..97c20ee 100644
+--- a/creativegan.py
++++ b/creativegan.py
+@@ -1,23 +1,20 @@
+ import argparse
+ import re
+ 
+-from utils import zdataset, show, labwidget, renormalize
++from utils import zdataset, renormalize #show, labwidget, renormalize
+ from rewrite import ganrewrite, rewriteapp
+ import torch, copy, os, json, shutil
+ from torchvision.utils import save_image
+ from torchvision import transforms
+ import utils.stylegan2, utils.proggan
+-from utils.stylegan2 import load_seq_stylegan
+-
++from utils.stylegan2.models import SeqStyleGAN2
+ import numpy as np
+ from sklearn.metrics import jaccard_score
+ import matplotlib.pyplot as plt
+ from PIL import Image
+ from tqdm import tqdm, trange
+ import cv2
+-
+ from utils import unet, anomaly
+-
+ from pytorch_msssim import ssim, ms_ssim
+ 
+ def _parse_num_range(s):
+@@ -53,22 +50,38 @@ parser.add_argument('--rank', type=int, default=30, help='rank used in rewriting
+ parser.add_argument('--lr', type=float, default=0.05, help='learning rate in rewriting')
+ parser.add_argument('--niter', type=float, default=2000, help='number of iterations in rewriting')
+ 
+-parser.add_argument('--n_outputs', type=int, default=9, help='Number of outputs to display')
++parser.add_argument('--n_outputs', type=int, default=10, help='Number of outputs to display')
+ 
+ parser.add_argument('--ssim', action='store_true', help="calculate ssim of modified model")
+ parser.add_argument('--novelty_score', action='store_true', help="calculate average novelty score of modified model")
+ 
++parser.add_argument('--gan_infer_batch_size', type=int, default=3, help="Batch size to generate design samples using StyleGAN2 model")
++parser.add_argument('--segment_infer_batch_size', type=int, default=3, help="Batch size to segment the design images using UNET model")
++parser.add_argument('--novelty_infer_batch_size', type=int, default=32, help="Batch size to segment the design images using WideResNet model")
++parser.add_argument('--intel', type=int, default=0, help='To apply Intel IPEX optimization')
++parser.add_argument('--num_samples_gan', type=int, default=10, help="Num of samples to generate from StyleGAN2")
++parser.add_argument('--use_quantized_models', type=int, default=0, help="Use INC Quantized model in pipeline")
++parser.add_argument('--wideresnet_quantized_model_path', type=str, help="Wideresnet quantized model path")
++parser.add_argument('--stylegan2_quantized_model_path', type=str, help="StyleGAN2 quantized model path")
++parser.add_argument('--resunet_quantized_model_path', type=str, help="Segmentation quantized model path")
+ 
+ args = parser.parse_args()
+ 
+ model_path = args.model_path
+ model_size = args.model_size
+ truncation = args.truncation
+-
++#INC related flags
++use_quantized_models = args.use_quantized_models
++wideresnet_quantized_model_path = args.wideresnet_quantized_model_path
++stylegan2_quantized_model_path = args.stylegan2_quantized_model_path
++resunet_quantized_model_path=args.resunet_quantized_model_path
++#Intel Flag
++intel = args.intel
++print("intel Optimizations:", intel)
++print("Quantization :",use_quantized_models)
++#Other Flags
+ name=args.name
+-
+ seg_model_path = args.seg_model_path
+-
+ data_path = args.data_path
+ k=args.k
+ anomaly_threshold = args.anomaly_threshold
+@@ -101,12 +114,56 @@ use_copy_as_paste_mask = False
+ dilate_mask= True
+ dilate_kernel_size=(16,16)
+ 
++segment_infer_batch_size = args.segment_infer_batch_size
++gan_infer_batch_size = args.gan_infer_batch_size
++novelty_infer_batch_size = args.novelty_infer_batch_size
++# segment_infer_batch_size = args.gan_infer_batch_size
++# novelty_infer_batch_size = args.gan_infer_batch_size
++
+ def dilate(mask,kernel_size=(8,8)):
+     kernel = np.ones(kernel_size, np.uint8)
+     mask = cv2.dilate(mask, kernel)
+     return mask
+ 
+-def segment(seg_model, images, ch=3, size=(224,224), threshold=0.5):
++def load_seq_stylegan(category, path=False, size=256, truncation=1.0,
++                      intel=False, quant_model=False, **kwargs):  # mconv='seq'):
++    """ loads nn sequential version of stylegan2 and puts on gpu"""
++    if path:
++        state_dict = torch.load(category)
++    else:
++        size = sizes[category]
++        state_dict = load_state_dict(category)
++    # size = sizes[category]
++    g = SeqStyleGAN2(size, style_dim=512, n_mlp=8, truncation=truncation, **kwargs)
++
++    if quant_model:
++        prefix = "_fqn_to_auto_quant_state_map."
++        f_clip = len(prefix)
++        suffix = "._extra_state"
++        b_clip = len(suffix)
++        adapted_dict = {}
++        for k, v in state_dict.items():
++            k = k.replace(':', '.')
++            if k.startswith(prefix):
++                k = k[f_clip:]
++            if k.endswith(suffix):
++                k = k[:-b_clip]
++            if k != ' ':
++                adapted_dict[k] = v
++        g.load_state_dict(adapted_dict)
++    else:
++        g.load_state_dict(state_dict['g_ema'],
++        latent_avg=state_dict['latent_avg'])
++
++    g.cpu().eval()
++
++    if intel:
++        import intel_extension_for_pytorch as ipex
++        g = ipex.optimize(g)
++        print("Intel Optimization applied in StyleGAN2 Model")
++    return g
++
++def segment(seg_model, images, ch=3, size=(224,224), threshold=0.5, use_quantized_models=False):
+     trans = transforms.Compose([
+                                 transforms.Resize((224,224)),
+                                 transforms.ToTensor(),
+@@ -115,10 +172,22 @@ def segment(seg_model, images, ch=3, size=(224,224), threshold=0.5):
+     images_tensor = torch.empty((len(images), ch, size[0], size[1]))
+     for i in range(len(images)):
+         images_tensor[i] = trans(images[i])
+-        
+-    seg_masks = seg_model(images_tensor.cuda()).sigmoid().detach().cpu()
++
++    d = torch.rand(images_tensor.size())
++    seg_model = torch.jit.trace(seg_model, d)
++    seg_model = torch.jit.freeze(seg_model)
++
++    if use_quantized_models:
++        print("warm up run start")
++        for i in range(10):
++            seg_masks = seg_model(images_tensor.cpu()).sigmoid().detach().cpu()
++    import time
++    start = time.time()
++    seg_masks = seg_model(images_tensor.cpu()).sigmoid().detach().cpu()
++    pred_time = time.time()-start
++    print('Prediction time for segmentation unet model: ',pred_time)
+     seg_masks = torch.where(seg_masks > threshold, torch.ones(seg_masks.size()), torch.zeros(seg_masks.size()))
+-    return seg_masks
++    return seg_masks, pred_time/len(images)
+ 
+ def masks_to_colorimg(masks):
+     colors = np.asarray([(201, 58, 64), (242, 207, 1), (0, 152, 75), (101, 172, 228),(56, 34, 132), (160, 194, 56), (155, 89, 182)])
+@@ -171,11 +240,11 @@ def show_masks(masks, gw):
+ if __name__ == '__main__':
+     # Choices: ganname = 'stylegan' or ganname = 'proggan'
+     ganname = 'stylegan'
+-
+     modelname = name
+-
+     layernum = layer
+ 
++    pipeline_total_time = 0
++
+     # Number of images to sample when gathering statistics.
+     size = 10000
+ 
+@@ -186,7 +255,8 @@ if __name__ == '__main__':
+ 
+     # Load (and download) a pretrained GAN
+     if ganname == 'stylegan':
+-        model = load_seq_stylegan(model_path, path=True, size=model_size, mconv='seq', truncation=truncation)
++        model = load_seq_stylegan(model_path, path=True, size=model_size, mconv='seq',
++                                  truncation=truncation, intel=False, quant_model=False)
+         Rewriter = ganrewrite.SeqStyleGanRewriter
+     elif ganname == 'proggan':
+         model = utils.proggan.load_pretrained(modelname)
+@@ -198,31 +268,59 @@ if __name__ == '__main__':
+         model, zds, layernum, cachedir=expdir,
+         low_rank_insert=True, low_rank_gradient=False,
+         use_linear_insert=False,  # If you set this to True, increase learning rate.e
+-        key_method='zca')
++        key_method='zca', intel=intel, lr = lr)
++    print('GAN Rewriter object created')
+ 
+     # Display a user interface to allow model rewriting.
+     savedir = f'masks/{ganname}/{modelname}'
+     interface = rewriteapp.GanRewriteApp(gw, size=256, mask_dir=savedir, num_canvases=32)
++    print('GAN Rewriter App object created')
+ 
+     # Create detector instance given a directory of the normal images
+-    ad = anomaly.AnomalyDetector(data_path, name=name, topk=k)
++    ad = anomaly.AnomalyDetector(data_path, name=name, topk=k, batch_size = args.novelty_infer_batch_size, intel=intel, use_quantized_models=0, quantized_model_path=wideresnet_quantized_model_path)
++    #ad = anomaly.AnomalyDetector(data_path, name=name, topk=k, batch_size = args.novelty_infer_batch_size, intel=0, use_quantized_models=0, quantized_model_path=wideresnet_quantized_model_path)
++    print('AnomalyDetector object created')
+ 
+     # Extract and cache embeddings of the normal images
+-    ad.load_train_features()
++    print('Start Loading Training Features')
++    total_pred_time=ad.load_train_features()
++    pipeline_total_time=pipeline_total_time+total_pred_time
++    print('Loaded Training Features')
+ 
+-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+-    seg_model = unet.ResNetUNet(seg_class).cuda()
++    #device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
++    device = "cpu"
++    seg_model = unet.ResNetUNet(seg_class).cpu()
++
++    seg_model.load_state_dict(torch.load(seg_model_path,map_location=torch.device('cpu')))
++
++    if use_quantized_models:
++        from neural_compressor.utils.pytorch import load
++        seg_model = load(resunet_quantized_model_path,seg_model)
++        print("Quantized Int8 Segmentation model loaded")
+ 
+-    seg_model.load_state_dict(torch.load(seg_model_path))
+     seg_model.eval()
+ 
++    if intel:
++        import intel_extension_for_pytorch as ipex
++        #self.model = self.model.to(memory_format=torch.channels_last)
++        seg_model = ipex.optimize(seg_model)
++        print("Intel Optimization segmentation model loaded")
++
+     print('unet loaded')
+ 
+     # Copy Mask
+-    image = gw.render_image(copy_id)
+-    copy_anomaly = ad.predict_anomaly_masks([image])
++    print('Processing Copy Mask')
++    image,stylegan_single_img_pred_time = gw.render_image(copy_id)
++    # pipeline_total_time = pipeline_total_time+stylegan_single_img_pred_time
++    print('start predicting novel masks')
++    copy_anomaly, total_pred_time = ad.predict_anomaly_masks([image])
++    pipeline_total_time = pipeline_total_time+total_pred_time
++
+     copy_mask = ad.threshold_masks(copy_anomaly, threshold=anomaly_threshold)[0]
+-    seg_mask = segment(seg_model, [image])[0]
++    print('start predicting segmentation copy masks')
++    seg_mask, seg_time = segment(seg_model, [image], use_quantized_models=use_quantized_models)
++    seg_mask = seg_mask[0]
++    pipeline_total_time = pipeline_total_time+seg_time
+ 
+     best_ch = find_best_seg_match(copy_mask, seg_mask.numpy(), channels=channels)
+     mask = seg_mask[best_ch].numpy()
+@@ -234,10 +332,17 @@ if __name__ == '__main__':
+     obj_acts, obj_output, obj_area, bounds = (gw.object_from_selection(copy_id, mask_url))
+     interface.request['object'] = (copy_id, mask_url)
+ 
+-
+     # Paste Mask
+-    image = gw.render_image(paste_id)
+-    seg_mask = segment(seg_model, [image])[0]
++    print('Processing Paste Mask')
++    image,stylegan_single_img_pred_time = gw.render_image(paste_id)
++
++    # pipeline_total_time = pipeline_total_time+stylegan_single_img_pred_time
++    print('start predicting segmentation paste masks')
++
++    seg_mask,seg_time = segment(seg_model, [image], use_quantized_models=use_quantized_models)
++    seg_mask = seg_mask[0]
++    pipeline_total_time = pipeline_total_time+seg_time
++
+     if not use_copy_as_paste_mask:
+         mask = seg_mask[best_ch].numpy()
+         if dilate_mask:
+@@ -248,13 +353,19 @@ if __name__ == '__main__':
+     interface.request['paste'] = (paste_id, mask_url)
+ 
+     # Render Paste Image
++    print('Rendering Paste Mask')
+     goal_in, goal_out, viz_out, bounds = gw.paste_from_selection(paste_id, mask_url, obj_acts, obj_area)
+     imgout = renormalize.as_url(gw.render_object(viz_out, box=bounds))
+     render_image = gw.render_object(viz_out, box=bounds)
+ 
+     #Context Mask
+-    images = gw.render_image_batch(key_ids)
+-    seg_masks = segment(seg_model, images)
++    print('Processsing Context Mask')
++    images,stylegan_batch_pred_time = gw.render_image_batch(key_ids, batch_size=gan_infer_batch_size)
++    # pipeline_total_time = pipeline_total_time+stylegan_batch_pred_time
++
++    print('start predicting segmentation context masks')
++    seg_masks,batch_seg_time = segment(seg_model, images, use_quantized_models=use_quantized_models)
++    pipeline_total_time = pipeline_total_time+batch_seg_time
+ 
+     best_seg_masks = seg_masks.permute(1,0,2,3)[best_ch]
+     interface.request['key'] = []
+@@ -268,104 +379,123 @@ if __name__ == '__main__':
+         interface.request['key'].append((idx, mask_url))
+ 
+     # Rewriting
++    print('start Rewriting GAN model')
+     def update_callback(it, loss):
+         if it % 50 == 0 or it == niter - 1:
+             loss_info = (f'lr {lr:.4f}\titer {it: 6d}/{niter: 6d}'
+                         f'\tloss {loss.item():.4f}')
+             print(loss_info, end='\r')
+                     
+-    gw.apply_edit(interface.request,
++    rewriting_time = gw.apply_edit(interface.request,
+                               rank=rank, niter=niter, piter=10, lr=lr,
+                               update_callback=update_callback)
++    #print("Total time taken in GAN Rewriting:",rewriting_time)
+ 
+ 
+     imgnum, mask = interface.request['key'][0]
+     key = gw.query_key_from_selection(imgnum, mask)
+-    sel, rq = gw.ranking_for_key(key, k=200)
++    sel, rq = gw.ranking_for_key(key, k=args.num_samples_gan)
+     img_nums = sel.tolist()
+ 
+-
+     saved_state_dict = copy.deepcopy(gw.model.state_dict())
+ 
+     with torch.no_grad():
+         gw.model.load_state_dict(saved_state_dict)
+-        edited_images = gw.render_image_batch(img_nums)
+-        gw.model.load_state_dict(interface.original_model.state_dict())
+-        images = gw.render_image_batch(img_nums)
++        edited_images,stylegan_batch_pred_time = gw.render_image_batch(img_nums,batch_size=args.gan_infer_batch_size)
++        print("Time taken in generating all samples from Modified StyleGAN is : ",stylegan_batch_pred_time)
++        # pipeline_total_time = pipeline_total_time+stylegan_batch_pred_time
+ 
+-        
+-    # Visualize Result
+-    offset = 2
+-    n = n_outputs
+-    n_col = 3
++        gw.model.load_state_dict(interface.original_model.state_dict())
++        images,stylegan_batch_pred_time = gw.render_image_batch(img_nums,batch_size=args.gan_infer_batch_size)
++        print("Time taken in generating all samples from Original StyleGAN is : ",stylegan_batch_pred_time)
++        pipeline_total_time = pipeline_total_time+stylegan_batch_pred_time
++
++    print("Total time taken in e2e pipeline: ",pipeline_total_time)
++    #Search for most compact design out of generated images
++    #Search for most compact design out of generated images
++    print("Filtering the most compact design image")
++    best_img = None
++    most_white_pix = 0
++    cnt = 0
++    for img in edited_images:
++        img_arr = np.asarray(img)
++        number_of_white_pix = np.sum(img_arr == 255)
++        if number_of_white_pix>most_white_pix:
++            most_white_pix=number_of_white_pix
++            best_img = img_arr
++        cnt += 1
++    cv2.imwrite(os.path.join(".","best_design_image.jpg"),best_img)
++    print("Best novel design image generated")
++    if args.ssim:
++        # Visualize Result
++        offset = 2
++        n = n_outputs
++        n_col = 3
+ 
+-    mask_savedir = "rewriting_masks"
+-    result_savedir = "rewriting_results"
++        mask_savedir = "rewriting_masks"
++        result_savedir = "rewriting_results"
+ 
+-    row = n//n_col
+-    col = n_col * 2
+-    fig, axes = plt.subplots(offset + row, col, figsize=(col*3, (offset+row)*3))
++        row = n//n_col
++        col = n_col * 2
++        fig, axes = plt.subplots(offset + row, col, figsize=(col*3, (offset+row)*3))
+ 
+-    for ax in axes.ravel():
+-        ax.axis('off')
++        for ax in axes.ravel():
++            ax.axis('off')
+ 
+-    req = interface.request
++        req = interface.request
+ 
+-    obj = render_mask(req['object'], gw)
+-    paste = render_mask(req['paste'], gw)
+-    axes[0, 0].imshow(obj)
+-    axes[0, 0].title.set_text('Copy')
+-    axes[0, 1].imshow(paste)
+-    axes[0, 1].title.set_text('Paste')
+-    axes[0, 2].imshow(render_image)
++        obj = render_mask(req['object'], gw)
++        paste = render_mask(req['paste'], gw)
++        axes[0, 0].imshow(obj)
++        axes[0, 0].title.set_text('Copy')
++        axes[0, 1].imshow(paste)
++        axes[0, 1].title.set_text('Paste')
++        axes[0, 2].imshow(render_image)
+ 
+-    axes[1, 0].title.set_text('Context')
+-    for i in range(min(n, len(req['key']))):
+-        context = render_mask(req['key'][i], gw)
+-        axes[1, i].imshow(context)
++        axes[1, 0].title.set_text('Context')
++        for i in range(min(n, len(req['key']))):
++            context = render_mask(req['key'][i], gw)
++            axes[1, i].imshow(context)
+ 
+ 
+-    for c in range(n_col):
+-        axes[offset, c*2].title.set_text('Original')
+-        axes[offset, c*2+1].title.set_text('Rewritten')
++        for c in range(n_col):
++            axes[offset, c*2].title.set_text('Original')
++            axes[offset, c*2+1].title.set_text('Rewritten')
+ 
+-    for i in range(n):
+-        axes[offset+i%row, i//row*2].imshow(images[i])
+-        axes[offset+i%row, i//row*2 + 1].imshow(edited_images[i])
+-        
+-    fig.show()
++        for i in range(n):
++            axes[offset+i%row, i//row*2].imshow(images[i])
++            axes[offset+i%row, i//row*2 + 1].imshow(edited_images[i])
+ 
+-    # Save Result
+-    os.makedirs(mask_savedir, exist_ok=True)
+-    os.makedirs(result_savedir, exist_ok=True)
++        # Save Result
++        os.makedirs(mask_savedir, exist_ok=True)
++        os.makedirs(result_savedir, exist_ok=True)
+ 
+-    overwrite = False
+-    ver = 0
+-    name = f"{modelname}_c{copy_id}_p{paste_id}_layer{layernum}_rank{rank}_exp"
++        overwrite = False
++        ver = 0
++        name = f"{modelname}_c{copy_id}_p{paste_id}_layer{layernum}_rank{rank}_exp"
+ 
+-    while os.path.exists(os.path.join(result_savedir, name+str(ver)+'.png')) and not overwrite:
+-        ver += 1
+-    name = name + str(ver)
+-    fig.savefig(os.path.join(result_savedir, name), bbox_inches='tight')
+-    data = interface.request
+-    data['sel'] = img_nums
++        while os.path.exists(os.path.join(result_savedir, name+str(ver)+'.png')) and not overwrite:
++            ver += 1
++        name = name + str(ver)
++        fig.savefig(os.path.join(result_savedir, name), bbox_inches='tight')
++        data = interface.request
++        data['sel'] = img_nums
+ 
+-    def convert(o):
+-        if isinstance(o, np.int64): return int(o)  
+-        raise TypeError
++        def convert(o):
++            if isinstance(o, np.int64): return int(o)
++            raise TypeError
+ 
+-    with open(os.path.join(mask_savedir, '%s.json' % name), 'w') as f:
+-        json.dump(data, f, indent=1, default=convert)
++        with open(os.path.join(mask_savedir, '%s.json' % name), 'w') as f:
++            json.dump(data, f, indent=1, default=convert)
+ 
+-    
+-    if args.ssim:
++        print("Start Calculating SSIM")
+         modified_dir = 'generated/modified'
+         if os.path.exists(modified_dir):
+             shutil.rmtree(modified_dir)
+         os.makedirs(modified_dir)
+ 
+         gw.model.load_state_dict(saved_state_dict)
+-        edited_images = gw.render_image_batch(list(range(100)))
++        edited_images, pred_time = gw.render_image_batch(list(range(10)),batch_size=args.gan_infer_batch_size)
+         for i, im in enumerate(edited_images):
+             filename = f'{i}.png'
+             filename = os.path.join(modified_dir, filename)
+@@ -388,7 +518,7 @@ if __name__ == '__main__':
+             for j, y in enumerate(gen_loader2):
+                 if len(y) < batch_size:
+                     x = xb.repeat(len(y), 1, 1, 1)
+-                ssim_mat[i][j*batch_size:j*batch_size+len(y)] = (1 - ssim(x.cuda(), y.cuda(), data_range=1, size_average=False))/2
++                ssim_mat[i][j*batch_size:j*batch_size+len(y)] = (1 - ssim(x.cpu(), y.cpu(), data_range=1, size_average=False))/2
+ 
+         # print('SSIM Mean: ', ssim_mat.mean().numpy())
+         # print('SSIM Top 1 Mean: ', torch.topk(ssim_mat, k=1).values.mean().numpy())
+@@ -398,10 +528,11 @@ if __name__ == '__main__':
+         print('SSIM Top 50 Mean: ', torch.topk(ssim_mat, k=50).values.mean().numpy())
+ 
+     if args.novelty_score:
++        print("Start Calculating Novelty Score")
+         anomaly_scores = []
+-        for i in range(0, 1000, 100):
+-            images = gw.render_image_batch(list(range(i,i+100)))
+-            scores = ad.predict_anomaly_scores(images)
++        for i in range(0, 10):
++            images, _ = gw.render_image_batch(list(range(i,i+100)), batch_size=args.gan_infer_batch_size)
++            scores, _ = ad.predict_anomaly_scores(images)
+             anomaly_scores.append(scores)
+ 
+         anomaly_scores = np.concatenate(anomaly_scores)
+diff --git a/download.sh b/download.sh
+index 678ba22..161c2e2 100755
+--- a/download.sh
++++ b/download.sh
+@@ -16,4 +16,6 @@ rm biked_dataset.tar.gz
+ 
+ wget "https://www.dropbox.com/s/p6a615wd8qh6j7h/test_data.tar.gz" -q -O test_data.tar.gz
+ tar -zxvf test_data.tar.gz
+-rm test_data.tar.gz
+\ No newline at end of file
++rm test_data.tar.gz
++
++python filter_dataset.py
+\ No newline at end of file
+diff --git a/experiment.sh b/experiment.sh
+deleted file mode 100755
+index 3cf093e..0000000
+--- a/experiment.sh
++++ /dev/null
+@@ -1,32 +0,0 @@
+-#!/bin/bash
+-python top_novel_bikes.py
+-
+-for frame in 907 728 348 960
+-do
+-	python creativegan.py --name "bike" \
+-                       --model_path "./models/stylegan2_bike.pt" \
+-                       --seg_model_path './models/segmentation_bike.pt' \
+-                       --seg_channels 0,3 \
+-                       --data_path './datasets/biked' \
+-                       --copy_id $frame \
+-                       --paste_id 7 \
+-                       --context_ids 7-12 \
+-                       --layernum 6 \
+-                       --ssim \
+-                       --novelty_score
+-done
+-
+-for handle in 580 811 576
+-do
+-	python creativegan.py --name "bike" \
+-                       --model_path "./models/stylegan2_bike.pt" \
+-                       --seg_model_path './models/segmentation_bike.pt' \
+-                       --seg_channels 3 \
+-                       --data_path './datasets/biked' \
+-                       --copy_id $handle \
+-                       --paste_id 7 \
+-                       --context_ids 7-12 \
+-                       --layernum 8 \
+-                       --ssim \
+-                       --novelty_score
+-done
+\ No newline at end of file
+diff --git a/rewrite/ganrewrite.py b/rewrite/ganrewrite.py
+index 750ebfe..681b6cc 100644
+--- a/rewrite/ganrewrite.py
++++ b/rewrite/ganrewrite.py
+@@ -8,6 +8,7 @@ import warnings
+ from utils import nethook, renormalize, pbar, tally, imgviz
+ from collections import OrderedDict
+ import torchvision
++from tqdm import tqdm
+ 
+ 
+ (all_obs, all_weight, all_CinvK, all_kCinvK, e_val, e_vec, kbasis,
+@@ -29,7 +30,9 @@ class ProgressiveGanRewriter(object):
+                  use_linear_insert=False,  # Use linear insert
+                  tight_paste=True,  # Paste to optimize over crop (vs whole image)
+                  alpha_area=True,  # Target composites drawn area (vs boundrect)
+-                 key_method='zca'  # Other options: 'svd', 'gandissect'
++                 key_method='zca',  # Other options: 'svd', 'gandissect'
++                 intel=False,
++                 lr = 0.5
+                  ):
+         self.firstlayer, self.lastlayer = self.maplayers(layernum)
+         self.cachedir = cachedir
+@@ -45,6 +48,23 @@ class ProgressiveGanRewriter(object):
+         self.device = next(model.parameters()).device
+         self.zds = zds
+         self.model = copy.deepcopy(model)
++        self.intel = intel
++
++        #if intel:
++            #import intel_extension_for_pytorch as ipex
++            #self.target_model = self.target_model.to(memory_format=torch.channels_last)
++            #self.target_model, self.target_model_optimizer = ipex.optimize(self.target_model,optimizer = self.target_model_optimizer)
++            #self.model = self.model.to(memory_format=torch.channels_last)
++            #self.model, self.model_optimizer = ipex.optimize(self.model,optimizer = self.model_optimizer)
++
++            #self.context_model = self.context_model.to(memory_format=torch.channels_last)
++            #self.context_model = ipex.optimize(self.context_model, optimizer=self.target_model_optimizer)
++
++            #self.rendering_model = self.rendering_model.to(memory_format=torch.channels_last)
++            #self.rendering_model = ipex.optimize(self.rendering_model, optimizer=self.target_model_optimizer)
++
++            #print("Intel Optimization applied in StyleGAN2 Model")
++
+         self.context_model = nethook.subsequence(
+             self.model, upto_layer=self.firstlayer,
+             share_weights=True)
+@@ -56,6 +76,7 @@ class ProgressiveGanRewriter(object):
+         self.rendering_model = nethook.subsequence(
+             self.model, after_layer=self.lastlayer,
+             share_weights=True)
++
+         with torch.no_grad():
+             sample_z = self.get_z(0)
+             sample_k = self.context_model(sample_z)
+@@ -170,7 +191,7 @@ class ProgressiveGanRewriter(object):
+         mkey = self.multi_key_from_selection(key_examples, rank=rank)
+         return self.insert(goal_in, goal_out, mkey,
+                            update_callback=update_callback,
+-                           niter=niter, piter=piter, lr=lr)
++                           niter=niter, piter=piter, lr=lr, return_timing=False)
+ 
+     def apply_overfit(self, request, niter=20001, lr=0.01,
+                       update_callback=None):
+@@ -279,6 +300,7 @@ class ProgressiveGanRewriter(object):
+             with torch.no_grad():
+                 ortho_weight = weight - projected_conv(weight, context)
+         optimizer = torch.optim.Adam(params, lr=lr)
++        #optimizer = self.target_model_optimizer
+ 
+         for it in range(niter):
+             with torch.enable_grad():
+@@ -371,7 +393,7 @@ class ProgressiveGanRewriter(object):
+                 row_dirs = self.zca_whitened_query_key(top_e_vec.t())
+                 just_avg = (all_zca_k).sum(0)
+                 # Orthogonalize row_dirs
+-                q, r = torch.qr(row_dirs.permute(1, 0))
++                q, r = torch.linalg.qr(row_dirs.permute(1, 0))
+                 # Flip the first eigenvec to agree with avg direction.
+                 signs = (q * just_avg[:, None]).sum(0).sign()
+                 q = q * signs[None, :]
+@@ -612,10 +634,14 @@ class ProgressiveGanRewriter(object):
+                                border_color=[255, 0, 0], thickness=3)
+ 
+     def render_image(self, imgnum, key=None, level=None, mask=None, **kwargs):
++        #print('render_image: generating single image sample from StyleGAN2')
++        start_time = time.time()
+         with torch.no_grad():
+             context_output = self.context_model(self.get_z(imgnum))
+             target_output = self.target_model(context_output)
+-            imgdata = self.rendered_image(self.rendering_model(target_output))
++            rendered_output = self.rendering_model(target_output)
++            pred_time = time.time()-start_time
++            imgdata = self.rendered_image(rendered_output)
+         if key is not None and level is not None:
+             tensorkey = key.to(self.device)[None, :, None, None]
+             acts = self.context_acts(self.context_model(self.get_z(imgnum)))
+@@ -625,20 +651,47 @@ class ProgressiveGanRewriter(object):
+         elif mask is not None:
+             iv = imgviz.ImageVisualizer(imgdata.shape[2:])
+             return iv.masked_image(imgdata, mask=mask, **kwargs)
+-        return renormalize.as_image(imgdata[0])
++        #print("Time taken in generating 1 sample from StyleGAN: ",pred_time)
++        return renormalize.as_image(imgdata[0]), pred_time
+ 
+-    def render_image_batch(self, imgnums, key=None, level=None, **kwargs):
+-        batch_size = 3
++    def render_image_batch(self, imgnums, key=None, level=None, batch_size = 3,**kwargs):
++        #batch_size = 3
++        print('render_image_batch: generating design suggestion number of images batch from StyleGAN2: ',len(imgnums))
++        print('with batch size: ',batch_size)
+         results = []
+-        for i in range(0, len(imgnums), batch_size):
++        total_time = 0
++
++        # if self.intel:
++        #     import intel_extension_for_pytorch as ipex
++        #     self.target_model.eval()
++        #     self.context_model.eval()
++        #     self.rendering_model.eval()
++        #     #self.target_model = self.target_model.to(memory_format=torch.channels_last)
++        #     self.target_model = ipex.optimize(self.target_model)
++
++        #     #self.context_model = self.context_model.to(memory_format=torch.channels_last)
++        #     self.context_model = ipex.optimize(self.context_model)
++
++        #     #self.rendering_model = self.rendering_model.to(memory_format=torch.channels_last)
++        #     self.rendering_model = ipex.optimize(self.rendering_model)
++
++        #     print("Intel Optimization applied in StyleGAN2 Model")
++        count = 0
++
++        for i in tqdm(range(0, len(imgnums), batch_size)):
+             imgnum_batch = imgnums[i:i + batch_size]
+             with torch.no_grad():
+                 z_batch = torch.cat([self.get_z(imgnum)
+                                      for imgnum in imgnum_batch])
++                start_time = time.time()
+                 context_output = self.context_model(z_batch)
+                 target_output = self.target_model(context_output)
++                rendered_output = self.rendering_model(target_output)
++                batch_pred_time = time.time()-start_time
++                total_time+=batch_pred_time
++                #print("Batch image prdicted from StyleGAN in {} time : ",batch_pred_time)
+                 imgdata_batch = self.rendered_image(
+-                    self.rendering_model(target_output))
++                    rendered_output)
+             if key is not None and level is not None:
+                 tensorkey = key.to(self.device)[None, :, None, None]
+                 acts = self.context_acts(self.context_model(z_batch))
+@@ -651,7 +704,9 @@ class ProgressiveGanRewriter(object):
+             else:
+                 results.extend([
+                     renormalize.as_image(imgdata) for imgdata in imgdata_batch])
+-        return results
++            count += 1
++        #print("Time taken in generating all samples from StyleGAN is : ",total_time)
++        return results, total_time/count
+ 
+     def rf(self, fn):
+         if self.cachedir is None:
+@@ -660,8 +715,8 @@ class ProgressiveGanRewriter(object):
+ 
+ 
+ class SeqStyleGanRewriter(ProgressiveGanRewriter):
+-    def __init__(self, model, zds, layernum, **kwargs):
+-        super().__init__(model, zds, layernum, **kwargs)
++    def __init__(self, model, zds, layernum, intel=False, lr=0.05, **kwargs):
++        super().__init__(model, zds, layernum, intel=intel, lr=lr, **kwargs)
+ 
+     def maplayers(self, layernum):
+         first = 'layer%d.sconv.mconv.dconv' % layernum
+@@ -703,8 +758,8 @@ class SeqStyleGanRewriter(ProgressiveGanRewriter):
+ 
+     def covariance_adjusted_query_key(self, k):
+         if len(k.shape) == 1:
+-            return torch.lstsq(k[:, None], self.c_matrix)[0][:, 0]
+-        return torch.lstsq(k.permute(1, 0), self.c_matrix)[0].permute(1, 0)
++            return torch.linalg.lstsq(k[:, None], self.c_matrix)[0][:, 0]
++        return torch.linalg.lstsq(k.permute(1, 0), self.c_matrix)[0].permute(1, 0)
+ 
+     def covariance_adjusted_key(self, k, kout):
+         return self.covariance_adjusted_query_key(k)
+@@ -823,7 +878,8 @@ def rank_one_conv(weight, direction):
+ 
+ 
+ def zca_from_cov(cov):
+-    evals, evecs = torch.symeig(cov.double(), eigenvectors=True)
++    # evals, evecs = torch.symeig(cov.double(), eigenvectors=True) #UPLO='U' if upper else 'L'
++    evals, evecs = torch.linalg.eigh(cov.double())
+     zca = torch.mm(torch.mm(evecs, torch.diag
+                             (evals.sqrt().clamp(1e-20).reciprocal())),
+                    evecs.t()).to(cov.dtype)
+diff --git a/rewrite/rewriteapp.py b/rewrite/rewriteapp.py
+index f3077e5..6e5b113 100644
+--- a/rewrite/rewriteapp.py
++++ b/rewrite/rewriteapp.py
+@@ -131,9 +131,10 @@ class GanRewriteApp(labwidget.Widget):
+         self.canvas_array = []
+         self.snap_image_array = []
+         for i in range(num_canvases):
++            img,time = self.gw.render_image(i)
+             self.canvas_array.append(paintwidget.PaintWidget(
+-                image=renormalize.as_url(
+-                    self.gw.render_image(i)),
++                image=renormalize.as_url(img
++                    ),
+                 # width=self.size * 3 // 4, height=self.size * 3 // 4
+                 width=self.size, height=self.size
+             ).on('mask', self.change_mask))
+diff --git a/setup/renv.yml b/setup/renv.yml
+deleted file mode 100644
+index be27b14..0000000
+--- a/setup/renv.yml
++++ /dev/null
+@@ -1,24 +0,0 @@
+-name: renv
+-channels:
+-  - pytorch
+-  - ostrokach-forge
+-  - conda-forge
+-dependencies:
+-  - python=3.6
+-  - cudatoolkit=10.2
+-  - pytorch=1.5.1
+-  - torchvision
+-  - numpy
+-  - scipy
+-  - scikit-learn
+-  - scikit-image
+-  - matplotlib
+-  - seaborn
+-  - numba
+-  - opencv
+-  - jupyter
+-  - jupyterlab
+-  - pyyaml
+-  - tqdm
+-  - pytorch-msssim
+-  - pip
+diff --git a/setup/setup_renv.sh b/setup/setup_renv.sh
+deleted file mode 100755
+index d769d78..0000000
+--- a/setup/setup_renv.sh
++++ /dev/null
+@@ -1,47 +0,0 @@
+-#!/usr/bin/env bash
+-
+-# Bash script to set up an anaconda python-based deep learning environment
+-# that has support for pytorch and needed dependencies.  It assumes that
+-# you have (mini)conda installed.
+-
+-# This should not require root.  However, it does copy and build a lot of
+-# binaries into your ~/.conda directory.  If you do not want to store
+-# these in your homedir disk, then ~/.conda can be a symlink somewhere else.
+-# (At MIT CSAIL, you should symlink ~/.conda to a directory on NFS or local
+-# disk instead of leaving it on AFS, or else you will exhaust your quota.)
+-
+-# Start from parent directory of script
+-cd "$(dirname "$(dirname "$(readlink -f "$0")")")"
+-
+-# Default RECIPE 'renv' can be overridden by 'RECIPE=foo setup.sh'
+-RECIPE=${RECIPE:-renv}
+-echo "Creating conda environment ${RECIPE}"
+-
+-if [[ ! $(type -P conda) ]]
+-then
+-    echo "conda not in PATH"
+-    echo "read: https://conda.io/docs/user-guide/install/index.html"
+-    exit 1
+-fi
+-
+-if df "${HOME}/.conda" --type=afs > /dev/null 2>&1
+-then
+-    echo "Not installing: your ~/.conda directory is on AFS."
+-    echo "Use 'ln -s /some/nfs/dir ~/.conda' to avoid using up your AFS quota."
+-    exit 1
+-fi
+-
+-# Uninstall existing environment
+-source deactivate
+-rm -rf ~/.conda/envs/${RECIPE}
+-
+-# Build new environment based on the recipe.
+-conda env create -f setup/${RECIPE}.yml
+-
+-# Set up CUDA_HOME to set itself up correctly on every source activate
+-# https://stackoverflow.com/questions/31598963
+-mkdir -p ~/.conda/envs/${RECIPE}/etc/conda/activate.d
+-echo "export CUDA_HOME=/usr/local/cuda-10.2" \
+-    > ~/.conda/envs/${RECIPE}/etc/conda/activate.d/CUDA_HOME.sh
+-
+-source activate ${RECIPE}
+diff --git a/top_novel_bikes.py b/top_novel_bikes.py
+index fb6fc9f..bc1615c 100644
+--- a/top_novel_bikes.py
++++ b/top_novel_bikes.py
+@@ -1,4 +1,4 @@
+-from utils import zdataset, show, labwidget, renormalize
++from utils import zdataset, renormalize#show, labwidget, renormalize
+ from rewrite import ganrewrite, rewriteapp
+ import torch, copy, os, json
+ from torchvision.utils import save_image
+@@ -7,47 +7,52 @@ import utils.stylegan2, utils.proggan
+ from utils.stylegan2 import load_seq_stylegan
+ 
+ import numpy as np
+-from sklearn.metrics import jaccard_score
++#from sklearn.metrics import jaccard_score
+ import matplotlib.pyplot as plt
+ from PIL import Image
+ from tqdm import tqdm, trange
+ import cv2
+ 
+ from utils import unet, anomaly
++import argparse
+ 
+-model_path = "./models/stylegan2_bike.pt"
+-model_size = 512
+-truncation = 0.5
+-
+-name='bike'
++parser = argparse.ArgumentParser()
+ 
+-seg_model_path = './models/segmentation_bike.pt'
++parser.add_argument('--model_path', type=str, required=True, help='Path to Stylegan model')
++parser.add_argument('--model_size', type=int, default=512, help='GAN model output size')
++parser.add_argument('--truncation', type=float, default=0.5, help="Value for truncation trick in Stylegan")
+ 
+-data_path = './datasets/biked'
+-# Using full bike dataset will crash due to RAM limit on Colab. Please use appropriate hardware or reduce the dataset size. 
+-# The dataset used will affect the novelty detection result.
+-# This demo uses the test dataset containing 50 images as opposed to full dataset with ~4k images, the result is different with the paper
++parser.add_argument('--data_path', type=str, required=True, help='Path to dataset, the folder should directly contain the images')
++parser.add_argument('--k', type=int, default=50, help='topk value for anomaly detection')
++parser.add_argument('--anomaly_threshold', type=int, default=3.5, help='Threshold for novelty segmentation')
++parser.add_argument('--intel', type=bool, default=False, help='To apply Intel IPEX optimization')
+ 
+-k=50
+-anomaly_threshold = 3.5
++parser.add_argument('--gan_infer_batch_size', type=int, default=3, help="Batch size to generate design samples using StyleGAN2 model")
++parser.add_argument('--num_samples_gan', type=int, default=10, help="Num samples to generate from StyleGAN2")
++parser.add_argument('--novelty_infer_batch_size', type=int, default=32, help="Batch size to segment the design images using WideResNet model")
++parser.add_argument('--lr', type=float, default=0.05, help='learning rate in rewriting')
+ 
+-# Copy id for frame example shown in overleaf paper
+-# 907, 728, 348, 960
++args = parser.parse_args()
+ 
+-# Copy id for handle example shown in overleaf paper
+-# 580, 811, 576
++model_path = "./models/stylegan2_bike.pt"
++model_path = args.model_path
++model_size = args.model_size
++truncation = args.truncation
++intel = args.intel
++lr = args.lr
++print(intel)
++name='bike'
+ 
+-copy_id=907
+-paste_id=7
+-key_ids=list(range(7,7+5))
++#data_path = './datasets/biked'
++data_path = args.data_path
++data_path = './datasets/test_data_2000'
++train_set_size = 1956
++# Using full bike dataset will crash due to RAM limit on Colab. Please use appropriate hardware or reduce the dataset size.
++# The dataset used will affect the novelty detection result.
++# This demo uses the test dataset containing 50 images as opposed to full dataset with ~4k images, the result is different with the paper
+ 
+-seg_class = 7
+-channels=[0, 3]
+-# 0 - frame
+-# 1 - saddle
+-# 2 - wheel
+-# 3 - handle
+-# eg. [0, 3] - only frame or handle will be used for rewriting
++k=args.k
++anomaly_threshold = args.anomaly_threshold
+ 
+ layer=6
+ rank=30
+@@ -76,7 +81,8 @@ os.makedirs(expdir, exist_ok=True)
+ 
+ # Load (and download) a pretrained GAN
+ if ganname == 'stylegan':
+-    model = load_seq_stylegan(model_path, path=True, size=model_size, mconv='seq', truncation=truncation)
++    model = load_seq_stylegan(model_path, path=True, size=model_size, mconv='seq', truncation=truncation, intel=intel)
++    print('StyleGAN2 model loaded')
+     Rewriter = ganrewrite.SeqStyleGanRewriter
+ elif ganname == 'proggan':
+     model = utils.proggan.load_pretrained(modelname)
+@@ -88,37 +94,52 @@ gw = Rewriter(
+     model, zds, layernum, cachedir=expdir,
+     low_rank_insert=True, low_rank_gradient=False,
+     use_linear_insert=False,  # If you set this to True, increase learning rate.e
+-    key_method='zca')
++    key_method='zca', intel=intel, lr = lr)
++print('GAN Rewriter object created')
+ 
+ # Display a user interface to allow model rewriting.
+ savedir = f'masks/{ganname}/{modelname}'
+ interface = rewriteapp.GanRewriteApp(gw, size=256, mask_dir=savedir, num_canvases=32)
++print('GAN Rewriter App object created')
+ 
+ # Create detector instance given a directory of the normal images
+-ad = anomaly.AnomalyDetector(data_path, name=name, topk=k)
++ad = anomaly.AnomalyDetector(data_path, name=name, topk=k , batch_size = args.novelty_infer_batch_size, intel=intel, use_quantized_models=True, quantized_model_path='./quantized_wideresnet_model')
++print('AnomalyDetector object created')
+ 
+ # Extract and cache embeddings of the normal images
++print('Start Loading Training Features')
+ ad.load_train_features()
+-
++print('Loaded Training Features')
+ 
+ import matplotlib.pyplot as plt
+ 
+ anomaly_scores = []
+-for i in range(0, 1000, 100):
+-    images = gw.render_image_batch(list(range(i,i+100)))
+-    scores = ad.predict_anomaly_scores(images)
++step = 10
++total_img_gen_time = 0
++total_novelty_detect_time = 0
++print('Generating design samples from StyleGAN2', args.num_samples_gan)
++#for i in range(0, 1000, 100):
++for i in range(0, args.num_samples_gan, step):
++    images, gen_time = gw.render_image_batch(list(range(i,i+step)), batch_size=args.gan_infer_batch_size)
++    total_img_gen_time += gen_time
++    scores,pred_time = ad.predict_anomaly_scores(images)
++    total_novelty_detect_time += pred_time
+     anomaly_scores.append(scores)
+-
++print('Total time taken in image generation : ',total_img_gen_time)
++print('Total time taken in novelty detection on generated suggestions : ',total_novelty_detect_time)
+ anomaly_scores = np.concatenate(anomaly_scores)
+ top_idx = anomaly_scores.argsort()[::-1]
+ 
+ row = 4
+ col = 5
+ 
++# import sys
++# sys.exit(1)
+ fig, axes = plt.subplots(row, col, figsize=(col*4,row*3))
+ 
+ for i in range(row*col):
+-    image = gw.render_image(top_idx[i])
++    image,pred_time = gw.render_image(top_idx[i])
++    print()
+     ax = axes[i//col, i%col]
+     ax.imshow(image)
+     ax.title.set_text(top_idx[i])
+@@ -136,10 +157,13 @@ train_dataset = anomaly.NormalDataset(data_path, grayscale=False, normalize=Fals
+ image_files = train_dataset.x
+ 
+ anomaly_scores = []
+-for i in range(0, 1000, 100):
++step = 100
++#for i in range(0, 1000, 100):
++for i in range(0, train_set_size, step):
+     images = []
+-    for x in range(i, i+100):
++    for x in range(i, i+step):
+         images.append(Image.open(image_files[x]).resize((256,256)))
++    print('Predicting Novelty Scores in Training Images')
+     scores = ad.predict_anomaly_scores(images, topk=k)
+     anomaly_scores.append(scores)
+ 
+@@ -159,4 +183,4 @@ for i in range(row*col):
+     ax.axis('off')
+ 
+ fig.tight_layout(pad=0)
+-fig.savefig(f'bike_dataset_novel_top{row*col}.jpg', bbox_inches='tight')
+\ No newline at end of file
++fig.savefig(f'bike_dataset_novel_top{row*col}.jpg', bbox_inches='tight')
+diff --git a/utils/anomaly.py b/utils/anomaly.py
+index acccaa5..081ebe2 100644
+--- a/utils/anomaly.py
++++ b/utils/anomaly.py
+@@ -4,9 +4,9 @@ import os
+ import pickle
+ from tqdm import tqdm
+ from collections import OrderedDict
+-from sklearn.metrics import roc_auc_score
+-from sklearn.metrics import roc_curve
+-from sklearn.metrics import precision_recall_curve
++#from sklearn.metrics import roc_auc_score
++#from sklearn.metrics import roc_curve
++#from sklearn.metrics import precision_recall_curve
+ from scipy.ndimage import gaussian_filter
+ import matplotlib.pyplot as plt
+ from PIL import Image
+@@ -19,18 +19,15 @@ from torchvision.models import wide_resnet50_2
+ 
+ from torchvision import transforms as T
+ 
+-from torch.utils.tensorboard import SummaryWriter
+-
+-import tensorflow as tf
+-import tensorboard as tb
+-tf.io.gfile = tb.compat.tensorflow_stub.io.gfile
+-
+-
+-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+-# device = 'cpu'
++#from torch.utils.tensorboard import SummaryWriter
+ 
++#import tensorflow as tf
++#import tensorboard as tb
++#tf.io.gfile = tb.compat.tensorflow_stub.io.gfile
++#device = 'cuda' if torch.cuda.is_available() else 'cpu'
++device = 'cpu'
+ class NormalDataset(Dataset):
+-    def __init__(self, path, resize=224, cropsize=224, grayscale=True, normalize=True, n=None):
++    def __init__(self, path, resize=224, cropsize=224, grayscale=True, normalize=True, n=500):
+         # assert class_name in CLASS_NAMES, 'class_name: {}, should be in {}'.format(class_name, CLASS_NAMES)
+         self.path = path
+         self.resize = resize
+@@ -38,6 +35,7 @@ class NormalDataset(Dataset):
+         
+         # load dataset
+         self.x = self.load_dataset_folder(n)
++        # import pdb;pdb.set_trace()
+ 
+         # set transforms
+         transform_x = [T.Resize(resize, Image.ANTIALIAS),
+@@ -82,7 +80,7 @@ class InferenceDataset(Dataset):
+         self.cropsize = cropsize
+ 
+         # load dataset
+-        self.images = images
++        self.images = images[:50]
+ 
+         # set transforms
+         transform_x = [T.Resize(resize, Image.ANTIALIAS),
+@@ -107,7 +105,10 @@ class InferenceDataset(Dataset):
+         return len(self.images)
+ 
+ class AnomalyDetector(object):
+-    def __init__(self, data_path, cache_path='./anomaly_cache', topk=5, resize=224, cropsize=224, grayscale=True, name='default'):
++    def __init__(self, data_path, cache_path='./anomaly_cache', topk=5, resize=224,
++                 cropsize=224, grayscale=True, name='default', batch_size = 32, intel=False,
++                 use_quantized_models=0, quantized_model_path=None, train_set_size=500):
++        self.outputs, self.model = None, None
+         self.name = name
+         self.topk = topk
+         self.data_path = data_path
+@@ -115,6 +116,9 @@ class AnomalyDetector(object):
+         self.resize = resize
+         self.cropsize = cropsize
+         self.grayscale = grayscale
++        self.batch_size = batch_size
++        self.use_quantized_models = use_quantized_models
++        self.quantized_model_path = quantized_model_path
+ 
+         self.transform_x = T.Compose([T.Resize(resize, Image.ANTIALIAS),
+                                       T.CenterCrop(cropsize),
+@@ -123,8 +127,9 @@ class AnomalyDetector(object):
+                                       T.Normalize(mean=[0.485, 0.456, 0.406],
+                                                   std=[0.229, 0.224, 0.225])])
+         
+-        self.train_dataset = NormalDataset(self.data_path, grayscale=self.grayscale, resize=self.resize, cropsize=self.cropsize)
+-        self.train_dataloader = DataLoader(self.train_dataset, batch_size=32, pin_memory=True)
++        self.train_dataset = NormalDataset(self.data_path, grayscale=self.grayscale,
++                                           resize=self.resize, cropsize=self.cropsize, n=train_set_size)
++        self.train_dataloader = DataLoader(self.train_dataset, batch_size=batch_size, pin_memory=True)
+ 
+         self.train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+         self.test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+@@ -133,93 +138,181 @@ class AnomalyDetector(object):
+         self.score_map_list = []
+ 
+         self.topk_indexes = None
++        self.intel = intel
+ 
+         # device setup
+-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+-        # device = 'cpu'
+-        
+-        # load model
+-        self.model = wide_resnet50_2(pretrained=True, progress=True)
+-        self.model.to(device)
+-        self.model.eval()
++        #device = 'cuda' if torch.cuda.is_available() else 'cpu'
++        device = 'cpu'
++        def hook(module, input, output):
++            self.outputs.append(output)
++
++        # self.model = self.get_loaded_model()
+ 
+-        # set model's intermediate outputs
++    def get_loaded_model(self):
++
++        # load model
++        device = 'cpu'
+         self.outputs = []
+-        
++        model = wide_resnet50_2(pretrained=True, progress=True)
++        model.to(device)
++        model.eval()
++
+         def hook(module, input, output):
+             self.outputs.append(output)
+ 
+-        self.model.layer1[-1].register_forward_hook(hook)
+-        self.model.layer2[-1].register_forward_hook(hook)
+-        self.model.layer3[-1].register_forward_hook(hook)
+-        self.model.avgpool.register_forward_hook(hook)
++        if self.use_quantized_models:
++            from neural_compressor.utils.pytorch import load
++            import intel_extension_for_pytorch as ipex
++            # model = load(self.quantized_model_path, model)  # leads to model not using hooks
++            for name, module in model.layer1.named_children():
++                if name == '2':
++                    module.register_forward_hook(hook)
++            for name, module in model.layer2.named_children():
++                if name == '3':
++                    module.register_forward_hook(hook)
++            for name, module in model.layer3.named_children():
++                if name == '5':
++                    module.register_forward_hook(hook)
++
++            model.avgpool.register_forward_hook(hook)
++            model = load(self.quantized_model_path, model)
++            # model = ipex.optimize(model, conv_bn_folding=False, linear_bn_folding=False)
++            print("Quantized Int8 WideResnet Model Loaded")
++
++        else:
++            if self.intel:
++                import intel_extension_for_pytorch as ipex
++
++                model = ipex.optimize(model, conv_bn_folding=False, linear_bn_folding=False)
++
++                for name, module in model.layer1.named_children():
++                    if name == '2':
++                        module.register_forward_hook(hook)
++                for name, module in model.layer2.named_children():
++                    if name == '3':
++                        module.register_forward_hook(hook)
++                for name, module in model.layer3.named_children():
++                    if name == '5':
++                        module.register_forward_hook(hook)
++
++                model.avgpool.register_forward_hook(hook)
++                print("Intel Optimization applied on WideResNet model")
++            else:
++                model.layer1[-1].register_forward_hook(hook)
++                model.layer2[-1].register_forward_hook(hook)
++                model.layer3[-1].register_forward_hook(hook)
++                model.avgpool.register_forward_hook(hook)
+ 
+         os.makedirs(os.path.join(self.cache_path, 'temp'), exist_ok=True)
+-    
+-    
++        return model
+ 
+     def load_train_features(self):
+-
++        print("*** Loading Traning dataset features ***")
++        self.model = self.get_loaded_model()
++        import time
+         # extract train set features
+         train_feature_filepath = os.path.join(self.cache_path, 'temp', 'train_%s.pkl' % os.path.basename(os.path.normpath(self.data_path)))
++        total_pred_time = 0
++        train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
++        self.train_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
++        count = 0
+         if not os.path.exists(train_feature_filepath):
+-            for x in tqdm(self.train_dataloader, '| feature extraction | train |'):
++            for x in tqdm(self.train_dataloader, '| Load Features | train |'):
++                #Not required in IPEX 1.13.0
++                # if self.intel:
++                #     x = x.to(memory_format=torch.channels_last)
+                 # model prediction
++                #print(x.shape)
+                 with torch.no_grad():
++                    start = time.time()
+                     pred = self.model(torch.unsqueeze(torch.mean(x.to(device),1),1).repeat(1,3, 1,1))
++                    pred_time = time.time()-start
++                    total_pred_time = total_pred_time + pred_time
++                    count += 1
+                     # get intermediate layer outputs
+-                    for k, v in zip(self.train_outputs.keys(), self.outputs):
+-                        self.train_outputs[k].append(v.cpu())
++                    for k, v in zip(train_outputs.keys(), self.outputs):
++                        train_outputs[k].append(v)
+                     # initialize hook outputs
+                     self.outputs = []
+-            for k, v in self.train_outputs.items():
+-                self.train_outputs[k] = torch.cat(v, 0).cpu()
++            # import pdb;pdb.set_trace()
++            total_pred_time /= count if count != 0 else 1
++            for k, v in train_outputs.items():
++               self.train_outputs[k] = torch.cat(v, 0).cpu()
++            print("Total Prediction Time for loading train features: ", total_pred_time)
++
+             # save extracted feature
+-            with open(train_feature_filepath, 'wb') as f:
+-                pickle.dump(self.train_outputs, f, protocol=4)
++            # print("*** Saving Extracted Training Image Features as pickle dump ***")
++            # with open(train_feature_filepath, 'wb') as f:
++            #    pickle.dump(self.train_outputs, f, protocol=4)
+         else:
+             print('load train set feature from: %s' % train_feature_filepath)
+             with open(train_feature_filepath, 'rb') as f:
+                 self.train_outputs = pickle.load(f)
+ 
++        return total_pred_time
++
+     def extract_image_features(self, images):
++        print("*** Extracting Image Features ***")
++        self.model = self.get_loaded_model()
++        import time
+         inference_dataset = InferenceDataset(images, grayscale=self.grayscale, resize=self.resize, cropsize=self.cropsize)
+-        inference_dataloader = DataLoader(inference_dataset, batch_size=32, pin_memory=True)
+-        
+-        self.test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
++        inference_dataloader = DataLoader(inference_dataset, batch_size=self.batch_size, pin_memory=True)
+         
++        test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
++        total_pred_time = 0
++        count = 0
+         for x in tqdm(inference_dataloader, '| feature extraction |'):
+             # self.test_imgs.extend(x.cpu().detach().numpy())
++            #print(x.shape)
++            #Not required in IPEX 1.13.0
++            # if self.intel:
++            #     x = x.to(memory_format=torch.channels_last)
+             # model prediction
++            # print(x.shape)
+             with torch.no_grad():
++                start = time.time()
+                 pred = self.model(x.to(device))
++                # pred = self.model(torch.unsqueeze(torch.mean(x.to(device), 1), 1).repeat(1, 3, 1, 1))
++                # self.model = get_model(self, use_quantized_models, intel, quantized_model_path)
++                pred_time = time.time()-start
++                total_pred_time = total_pred_time + pred_time
++                count += 1
+             # get intermediate layer outputs
+-            for k, v in zip(self.test_outputs.keys(), self.outputs):
+-                self.test_outputs[k].append(v)
++            for k, v in zip(test_outputs.keys(), self.outputs):
++                test_outputs[k].append(v)
+             # initialize hook outputs
+             self.outputs = []
+-        for k, v in self.test_outputs.items():
++        total_pred_time /= count if count != 0 else 1
++        print("Total Prediction Time for extract image features: ",total_pred_time)
++        # import pdb;pdb.set_trace()
++        for k, v in test_outputs.items():
+             self.test_outputs[k] = torch.cat(v, 0)
++        return total_pred_time
+     
+     def predict_anomaly_scores(self, images, topk=None):
++        total_pred_time = 0
+         if len(self.train_outputs['avgpool']) == 0:
+-            self.load_train_features()
++            p_time = self.load_train_features()
++            total_pred_time+=p_time
+             
+         if topk==None:
+             topk = self.topk
+ 
+-        self.extract_image_features(images)
+-        
++        e_time = self.extract_image_features(images)
++        total_pred_time+=e_time
++        # import pdb;pdb.set_trace()
+         dist_matrix = calc_dist_matrix(torch.flatten(self.test_outputs['avgpool'], 1),
+                                torch.flatten(self.train_outputs['avgpool'], 1))
+-        
++
+         topk_values, self.topk_indexes = torch.topk(dist_matrix, k=topk, dim=1, largest=False)
+         scores = torch.mean(topk_values, 1).cpu().detach().numpy()
+         self.scores = scores
+-        return scores
++        return scores, total_pred_time
++        # return total_pred_time
+     
+     def predict_anomaly_masks(self, images, topk=None):
+-        self.predict_anomaly_scores(images, topk=topk)
++        print("***Predicting Anomaly Masks***")
++        scores,total_pred_time = self.predict_anomaly_scores(images, topk=topk)
+ 
+         score_map_list = []
+ 
+@@ -249,15 +342,20 @@ class AnomalyDetector(object):
+             score_map = torch.mean(torch.cat(score_maps, 0), dim=0)
+ 
+             # apply gaussian smoothing on the score map
+-            score_map = gaussian_filter(score_map.squeeze().cpu().detach().numpy(), sigma=4)
++            score_map_np = score_map.squeeze().cpu().detach().numpy()
++            #print(score_map_np.shape)
++            print('Applying Gussian filter on anomaly scores')
++            score_map = gaussian_filter(score_map_np, sigma=4)
+             score_map_list.append(score_map)
+         
+         self.score_map_list = score_map_list
+-        return score_map_list
++        return score_map_list, total_pred_time
+     
+     def predict_anomaly_masks_alt(self,images):
+-
++        print("***Predicting Anomaly Mask Alt***")
++        import time
+         grads = []
++        self.model = self.get_loaded_model()
+         def grad_hook(module, input, output):
+             grads.append(output[0])
+         
+@@ -267,13 +365,17 @@ class AnomalyDetector(object):
+         inference_dataset = InferenceDataset(images, grayscale=self.grayscale, resize=self.resize, cropsize=self.cropsize)
+         inference_dataloader = DataLoader(inference_dataset, batch_size=32, pin_memory=True)
+         grad_mask = []
++        total_pred_time = 0
+         for x in tqdm(inference_dataloader, '| feature extraction |'):
+             # self.test_imgs.extend(x.cpu().detach().numpy())
+             # model prediction
+             self.test_outputs = OrderedDict([('layer1', []), ('layer2', []), ('layer3', []), ('avgpool', [])])
+             in_images = x.to(device)
+             in_images.requires_grad = True
++            start = time.time()
+             pred = self.model(in_images)
++            pred_time = time.time()-start
++            total_pred_time = total_pred_time + pred_time
+             # get intermediate layer outputs
+             for k, v in zip(self.test_outputs.keys(), self.outputs):
+                 self.test_outputs[k]= v
+@@ -287,7 +389,7 @@ class AnomalyDetector(object):
+             # initialize hook outputs
+             self.outputs = []
+             grads = []
+-            
++        print("Total Prediction Time: ",total_pred_time)
+         masks = [[],[]]
+         for grad_m in grad_mask:
+             for i in range(2):
+@@ -309,6 +411,7 @@ class AnomalyDetector(object):
+         return results
+     
+     def visualize_embedding(self, images, logdir='./embeddings', train=True, n=None, threshold=1, sprite_size=32, grayscale=False):
++        print("*** Visualize Embeddings ***")
+         train_dataset = NormalDataset(self.data_path, grayscale=grayscale, normalize=False)
+         train_dataloader = DataLoader(train_dataset, batch_size=32, pin_memory=True)
+         inference_dataset = InferenceDataset(images, grayscale=grayscale, normalize=False)
+diff --git a/utils/labwidget.py b/utils/labwidget.py
+index 869185f..cbd0771 100644
+--- a/utils/labwidget.py
++++ b/utils/labwidget.py
+@@ -871,7 +871,7 @@ class Div(Widget):
+ 
+     def show(self, *args):
+         from . import show
+-        self.innerHTML = show.html(args)
++        #self.innerHTML = show.html(args)
+ 
+     def print(self, *args, replace=False):
+         """Appends plain text (as a pre) into the div."""
+diff --git a/utils/quickdissect.py b/utils/quickdissect.py
+index cb61da7..91802e1 100644
+--- a/utils/quickdissect.py
++++ b/utils/quickdissect.py
+@@ -23,27 +23,27 @@ def main():
+     torch.backends.cudnn.profile = True
+ 
+     model = nethook.InstrumentedModel(
+-        proggan.load_pretrained(args.model)).cuda()
++        proggan.load_pretrained(args.model)).cpu()
+     model.retain_layer(args.layer)
+ 
+     zds = zdataset.z_dataset_for_model(model, size=args.sample_size, seed=1)
+ 
+-    model(zds[0][0][None].cuda())
++    model(zds[0][0][None].cpu())
+     sample_act = model.retained_layer(args.layer).cpu()
+     upfn = upsample.upsampler((64, 64), sample_act.shape[2:])
+ 
+     def flat_acts(zbatch):
+-        _ = model(zbatch.cuda())
++        _ = model(zbatch.cpu())
+         acts = upfn(model.retained_layer(args.layer))
+         return acts.permute(0, 2, 3, 1).contiguous().view(-1, acts.shape[1])
+ 
+     rq = tally.tally_quantile(flat_acts, zds, cachefile=resfn('rq.npz'))
+-    level_at_cutoff = rq.quantiles(0.99)[None, :, None, None].cuda()
++    level_at_cutoff = rq.quantiles(0.99)[None, :, None, None].cpu()
+ 
+     segmodel, seglabels = segmenter.load_segmenter(args.seg)
+ 
+     def compute_cond_indicator(zbatch):
+-        image_batch = model(zbatch.cuda())
++        image_batch = model(zbatch.cpu())
+         seg = segmodel.segment_batch(image_batch, downsample=4)
+         acts = upfn(model.retained_layer(args.layer))
+         iacts = (acts > level_at_cutoff).float()
+@@ -70,14 +70,14 @@ def main():
+         json.dump(seglabels, f)
+ 
+     def compute_image_max(zbatch):
+-        image_batch = model(zbatch.cuda())
++        image_batch = model(zbatch.cpu())
+         return model.retained_layer(args.layer).max(3)[0].max(2)[0]
+ 
+     topk = tally.tally_topk(compute_image_max, zds,
+                             cachefile=resfn('topk.npz'))
+ 
+     def compute_acts(zbatch):
+-        image_batch = model(zbatch.cuda())
++        image_batch = model(zbatch.cpu())
+         acts_batch = model.retained_layer(args.layer)
+         return (acts_batch, image_batch)
+ 
+diff --git a/utils/show.py b/utils/show.py
+index 463865b..1882723 100644
+--- a/utils/show.py
++++ b/utils/show.py
+@@ -11,11 +11,11 @@
+ import PIL.Image
+ import base64
+ import io
+-import IPython
++#import IPython
+ import types
+ import sys
+ import html as html_module
+-from IPython.display import display
++#from IPython.display import display
+ 
+ g_buffer = None
+ 
+diff --git a/utils/stylegan2/__init__.py b/utils/stylegan2/__init__.py
+index ba5bb87..9c0e62f 100644
+--- a/utils/stylegan2/__init__.py
++++ b/utils/stylegan2/__init__.py
+@@ -49,7 +49,7 @@ def load_state_dict(category):
+         sd = torch.hub.model_zoo.load_url(url)  # pytorch 1.0
+     return sd
+     
+-def load_seq_stylegan(category, path=False, size=256, truncation=1.0, **kwargs):  # mconv='seq'):
++def load_seq_stylegan(category, path=False, size=256, truncation=1.0, intel=False, **kwargs):  # mconv='seq'):
+     ''' loads nn sequential version of stylegan2 and puts on gpu'''
+     if path:
+         state_dict = torch.load(category)
+@@ -57,8 +57,16 @@ def load_seq_stylegan(category, path=False, size=256, truncation=1.0, **kwargs):
+         size = sizes[category]
+         state_dict = load_state_dict(category)
+     # size = sizes[category]
++    print(state_dict.keys())
+     g = SeqStyleGAN2(size, style_dim=512, n_mlp=8, truncation=truncation, **kwargs)
+     g.load_state_dict(state_dict['g_ema'],
+-            latent_avg=state_dict['latent_avg'])
+-    g.cuda()
++        latent_avg=state_dict['latent_avg'])
++    #g.cuda()
++    g.cpu()
++
++    if intel:
++        import intel_extension_for_pytorch as ipex
++        g.eval()
++        g = ipex.optimize(g)
++        print("Intel Optimization applied in StyleGAN2 Model")
+     return g
+diff --git a/utils/stylegan2/models.py b/utils/stylegan2/models.py
+index 57614ff..c2a51b2 100644
+--- a/utils/stylegan2/models.py
++++ b/utils/stylegan2/models.py
+@@ -542,7 +542,7 @@ class NoiseInjectionF(nn.Module):
+         if noise is None:
+             noise = np.random.RandomState(0).randn(
+                     batch, height * width).astype('float32')
+-            noise = torch.from_numpy(noise).cuda().view(batch, 1, height, width)
++            noise = torch.from_numpy(noise).cpu().view(batch, 1, height, width)
+         return DataBag(data, fmap=image + self.weight * noise)
+ 
+ class ConstantInputF(nn.Module):
+@@ -649,7 +649,7 @@ class ToRGBF(nn.Module):
+                     skip = self.upsample(skip)
+                 else:
+                     # print('Missing upsample!')
+-                    upsample = Upsample([1, 3, 3, 1]).cuda()
++                    upsample = Upsample([1, 3, 3, 1]).cpu()
+                     skip = upsample(skip)
+             out = out + skip
+         return DataBag(data, output=out)
+diff --git a/utils/stylegan2/op/fused_act.py b/utils/stylegan2/op/fused_act.py
+index 39c5bfe..2f876cf 100755
+--- a/utils/stylegan2/op/fused_act.py
++++ b/utils/stylegan2/op/fused_act.py
+@@ -1,86 +1,128 @@
+ import os
+-
+-import torch
+-from torch import nn
+-from torch.autograd import Function
+-from torch.utils.cpp_extension import load
+-
+-
+-module_path = os.path.dirname(__file__)
+-fused = load(
+-    'fused',
+-    sources=[
+-        os.path.join(module_path, 'fused_bias_act.cpp'),
+-        os.path.join(module_path, 'fused_bias_act_kernel.cu'),
+-    ],
+-)
+-
+-
+-class FusedLeakyReLUFunctionBackward(Function):
+-    @staticmethod
+-    def forward(ctx, grad_output, out, negative_slope, scale):
+-        ctx.save_for_backward(out)
+-        ctx.negative_slope = negative_slope
+-        ctx.scale = scale
+-
+-        empty = grad_output.new_empty(0)
+-
+-        grad_input = fused.fused_bias_act(
+-            grad_output, empty, out, 3, 1, negative_slope, scale
+-        )
+-
+-        dim = [0]
+-
+-        if grad_input.ndim > 2:
+-            dim += list(range(2, grad_input.ndim))
+-
+-        grad_bias = grad_input.sum(dim).detach()
+-
+-        return grad_input, grad_bias
+-
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++from torch.autograd import Function
++from torch.utils.cpp_extension import load
++
++
++module_path = os.path.dirname(__file__)
++#fused = load(
++#    "fused",
++#    sources=[
++#        os.path.join(module_path, "fused_bias_act.cpp"),
++#        os.path.join(module_path, "fused_bias_act_kernel.cu"),
++#    ],
++#)
++
++
++class FusedLeakyReLUFunctionBackward(Function):
++    @staticmethod
++    def forward(ctx, grad_output, out, bias, negative_slope, scale):
++        ctx.save_for_backward(out)
++        ctx.negative_slope = negative_slope
++        ctx.scale = scale
++
++        empty = grad_output.new_empty(0)
++
++        grad_input = fused.fused_bias_act(
++            grad_output.contiguous(), empty, out, 3, 1, negative_slope, scale
++        )
++
++        dim = [0]
++
++        if grad_input.ndim > 2:
++            dim += list(range(2, grad_input.ndim))
++
++        if bias:
++            grad_bias = grad_input.sum(dim).detach()
++
++        else:
++            grad_bias = empty
++
++        return grad_input, grad_bias
++
+     @staticmethod
+-    def backward(ctx, gradgrad_input, gradgrad_bias):
+-        out, = ctx.saved_tensors
+-        gradgrad_out = fused.fused_bias_act(
+-            gradgrad_input, gradgrad_bias, out, 3, 1, ctx.negative_slope, ctx.scale
+-        )
+-
+-        return gradgrad_out, None, None, None
+-
+-
+-class FusedLeakyReLUFunction(Function):
+-    @staticmethod
+-    def forward(ctx, input, bias, negative_slope, scale):
+-        empty = input.new_empty(0)
+-        out = fused.fused_bias_act(input, bias, empty, 3, 0, negative_slope, scale)
+-        ctx.save_for_backward(out)
+-        ctx.negative_slope = negative_slope
++    def backward(ctx, gradgrad_input, gradgrad_bias):
++        out, = ctx.saved_tensors
++        gradgrad_out = fused.fused_bias_act(
++            gradgrad_input.contiguous(),
++            gradgrad_bias,
++            out,
++            3,
++            1,
++            ctx.negative_slope,
++            ctx.scale,
++        )
++
++        return gradgrad_out, None, None, None, None
++
++
++class FusedLeakyReLUFunction(Function):
++    @staticmethod
++    def forward(ctx, input, bias, negative_slope, scale):
++        empty = input.new_empty(0)
++
++        ctx.bias = bias is not None
++
++        if bias is None:
++            bias = empty
++
++        out = fused.fused_bias_act(input, bias, empty, 3, 0, negative_slope, scale)
++        ctx.save_for_backward(out)
++        ctx.negative_slope = negative_slope
+         ctx.scale = scale
+ 
+         return out
+ 
+     @staticmethod
+     def backward(ctx, grad_output):
+-        out, = ctx.saved_tensors
+-
+-        grad_input, grad_bias = FusedLeakyReLUFunctionBackward.apply(
+-            grad_output, out, ctx.negative_slope, ctx.scale
+-        )
+-
+-        return grad_input, grad_bias, None, None
+-
+-
+-class FusedLeakyReLU(nn.Module):
+-    def __init__(self, channel, negative_slope=0.2, scale=2 ** 0.5):
+-        super().__init__()
+-
+-        self.bias = nn.Parameter(torch.zeros(channel))
+-        self.negative_slope = negative_slope
+-        self.scale = scale
+-
++        out, = ctx.saved_tensors
++
++        grad_input, grad_bias = FusedLeakyReLUFunctionBackward.apply(
++            grad_output, out, ctx.bias, ctx.negative_slope, ctx.scale
++        )
++
++        if not ctx.bias:
++            grad_bias = None
++
++        return grad_input, grad_bias, None, None
++
++
++class FusedLeakyReLU(nn.Module):
++    def __init__(self, channel, bias=True, negative_slope=0.2, scale=2 ** 0.5):
++        super().__init__()
++
++        if bias:
++            self.bias = nn.Parameter(torch.zeros(channel))
++
++        else:
++            self.bias = None
++
++        self.negative_slope = negative_slope
++        self.scale = scale
++
+     def forward(self, input):
+-        return fused_leaky_relu(input, self.bias, self.negative_slope, self.scale)
+-
+-
+-def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
+-    return FusedLeakyReLUFunction.apply(input, bias, negative_slope, scale)
++        return fused_leaky_relu(input, self.bias, self.negative_slope, self.scale)
++
++
++def fused_leaky_relu(input, bias=None, negative_slope=0.2, scale=2 ** 0.5):
++    if input.device.type == "cpu":
++        if bias is not None:
++            rest_dim = [1] * (input.ndim - bias.ndim - 1)
++            return (
++                F.leaky_relu(
++                    input + bias.view(1, bias.shape[0], *rest_dim), negative_slope=0.2
++                )
++                * scale
++            )
++
++        else:
++            return F.leaky_relu(input, negative_slope=0.2) * scale
++
++    else:
++        print("Device Type: GPU")
++        return FusedLeakyReLUFunction.apply(
++            input.contiguous(), bias, negative_slope, scale
++        )
+diff --git a/utils/stylegan2/op/upfirdn2d.py b/utils/stylegan2/op/upfirdn2d.py
+index d4e2fdc..8484444 100755
+--- a/utils/stylegan2/op/upfirdn2d.py
++++ b/utils/stylegan2/op/upfirdn2d.py
+@@ -1,21 +1,23 @@
+-import os
+-
+-import torch
+-from torch.autograd import Function
+-from torch.utils.cpp_extension import load
+-
+-
+-module_path = os.path.dirname(__file__)
+-upfirdn2d_op = load(
+-    'upfirdn2d',
+-    sources=[
+-        os.path.join(module_path, 'upfirdn2d.cpp'),
+-        os.path.join(module_path, 'upfirdn2d_kernel.cu'),
+-    ],
+-)
+-
+-
+-class UpFirDn2dBackward(Function):
++from collections import abc
++import os
++
++import torch
++from torch.nn import functional as F
++from torch.autograd import Function
++from torch.utils.cpp_extension import load
++
++
++module_path = os.path.dirname(__file__)
++#upfirdn2d_op = load(
++#    "upfirdn2d",
++#    sources=[
++#        os.path.join(module_path, "upfirdn2d.cpp"),
++#        os.path.join(module_path, "upfirdn2d_kernel.cu"),
++#    ],
++#)
++
++
++class UpFirDn2dBackward(Function):
+     @staticmethod
+     def forward(
+         ctx, grad_output, kernel, grad_kernel, up, down, pad, g_pad, in_size, out_size
+@@ -96,14 +98,14 @@ class UpFirDn2d(Function):
+         ctx.in_size = input.shape
+ 
+         input = input.reshape(-1, in_h, in_w, 1)
+-
+-        ctx.save_for_backward(kernel, torch.flip(kernel, [0, 1]))
+-
+-        out_h = (in_h * up_y + pad_y0 + pad_y1 - kernel_h) // down_y + 1
+-        out_w = (in_w * up_x + pad_x0 + pad_x1 - kernel_w) // down_x + 1
+-        ctx.out_size = (out_h, out_w)
+-
+-        ctx.up = (up_x, up_y)
++
++        ctx.save_for_backward(kernel, torch.flip(kernel, [0, 1]))
++
++        out_h = (in_h * up_y + pad_y0 + pad_y1 - kernel_h + down_y) // down_y
++        out_w = (in_w * up_x + pad_x0 + pad_x1 - kernel_w + down_x) // down_x
++        ctx.out_size = (out_h, out_w)
++
++        ctx.up = (up_x, up_y)
+         ctx.down = (down_x, down_y)
+         ctx.pad = (pad_x0, pad_x1, pad_y0, pad_y1)
+ 
+@@ -123,38 +125,55 @@ class UpFirDn2d(Function):
+         return out
+ 
+     @staticmethod
+-    def backward(ctx, grad_output):
+-        kernel, grad_kernel = ctx.saved_tensors
+-
+-        grad_input = UpFirDn2dBackward.apply(
+-            grad_output,
+-            kernel,
+-            grad_kernel,
+-            ctx.up,
+-            ctx.down,
+-            ctx.pad,
+-            ctx.g_pad,
+-            ctx.in_size,
+-            ctx.out_size,
+-        )
+-
+-        return grad_input, None, None, None, None
+-
+-
+-def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
+-    out = UpFirDn2d.apply(
+-        input, kernel, (up, up), (down, down), (pad[0], pad[1], pad[0], pad[1])
+-    )
+-
+-    return out
+-
+-
+-def upfirdn2d_native(
+-    input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, pad_y0, pad_y1
+-):
+-    _, in_h, in_w, minor = input.shape
+-    kernel_h, kernel_w = kernel.shape
+-
++    def backward(ctx, grad_output):
++        kernel, grad_kernel = ctx.saved_tensors
++
++        grad_input = None
++
++        if ctx.needs_input_grad[0]:
++            grad_input = UpFirDn2dBackward.apply(
++                grad_output,
++                kernel,
++                grad_kernel,
++                ctx.up,
++                ctx.down,
++                ctx.pad,
++                ctx.g_pad,
++                ctx.in_size,
++                ctx.out_size,
++            )
++
++        return grad_input, None, None, None, None
++
++
++def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
++    if not isinstance(up, abc.Iterable):
++        up = (up, up)
++
++    if not isinstance(down, abc.Iterable):
++        down = (down, down)
++
++    if len(pad) == 2:
++        pad = (pad[0], pad[1], pad[0], pad[1])
++
++    if input.device.type == "cpu":
++        out = upfirdn2d_native(input, kernel, *up, *down, *pad)
++
++    else:
++        out = UpFirDn2d.apply(input, kernel, up, down, pad)
++
++    return out
++
++
++def upfirdn2d_native(
++    input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, pad_y0, pad_y1
++):
++    _, channel, in_h, in_w = input.shape
++    input = input.reshape(-1, in_h, in_w, 1)
++
++    _, in_h, in_w, minor = input.shape
++    kernel_h, kernel_w = kernel.shape
++
+     out = input.view(-1, in_h, 1, in_w, 1, minor)
+     out = F.pad(out, [0, 0, 0, up_x - 1, 0, 0, 0, up_y - 1])
+     out = out.view(-1, in_h * up_y, in_w * up_x, minor)
+@@ -179,9 +198,12 @@ def upfirdn2d_native(
+         -1,
+         minor,
+         in_h * up_y + pad_y0 + pad_y1 - kernel_h + 1,
+-        in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1,
+-    )
+-    out = out.permute(0, 2, 3, 1)
+-
+-    return out[:, ::down_y, ::down_x, :]
+-
++        in_w * up_x + pad_x0 + pad_x1 - kernel_w + 1,
++    )
++    out = out.permute(0, 2, 3, 1)
++    out = out[:, ::down_y, ::down_x, :]
++
++    out_h = (in_h * up_y + pad_y0 + pad_y1 - kernel_h + down_y) // down_y
++    out_w = (in_w * up_x + pad_x0 + pad_x1 - kernel_w + down_x) // down_x
++
++    return out.view(-1, channel, out_h, out_w)
