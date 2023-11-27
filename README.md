@@ -439,6 +439,10 @@ Intel technologies may require enabled hardware, software or service activation.
 
 **Configuration Details and Workload Setup**: Azure D8v5 (Intel® Xeon® Platinum 8370C CPU @ 2.80GHz), 1 Socket, 4 Cores per Socket, 2 Threads per Core, Turbo: On, Total Memory: 32 GB, OS: Ubuntu 20.04, Kernel: Linux 5.15.0-1019-azure. Framework/Toolkit: PyTorch v1.13.0, Intel® Extension for PyTorch v1.13.0, Intel® Neural Compressor v2.0, Python 3.9.15. Dataset size: ~2k training RGB images of bike Model: StyleGAN2 for image generation, WideResNet for feature extraction and ResUNet for segmentation of novel features. 
 
+To the extent that any public or non-Intel datasets or models are referenced by or accessed using tools or code on this site those datasets or models are provided by the third party indicated as the content source. Intel does not create the content and does not warrant its accuracy or quality. By accessing the public content, or using materials trained on or with such content, you agree to the terms associated with that content and that your use complies with the applicable license.
+ 
+Intel expressly disclaims the accuracy, adequacy, or completeness of any such public content, and is not liable for any errors, omissions, or defects in the content, or for any reliance on the content. Intel is not liable for any liability or damages relating to your use of public content.
+
 **Testing performed by** Intel Corporation
 
 ## Appendix
